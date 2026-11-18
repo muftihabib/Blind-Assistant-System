@@ -1,22 +1,67 @@
-import os
+"""
+Central configuration for the Blind Assistance System.
+
+Every number that appears in the paper (thresholds, priors, timings) is
+defined here so that the code and the paper can be checked against each
+other in one place.
+"""
+
+# ── Camera ───────────────────────────────────────────────────────────────────
 CAMERA_INDEX   = 0
-FRAME_WIDTH    = 1280
+FRAME_WIDTH    = 1280          # capture resolution; bounding boxes are in THIS frame
 FRAME_HEIGHT   = 720
 FPS_TARGET     = 30
 
+# ── Detector ─────────────────────────────────────────────────────────────────
 MODEL_PATH         = "models/yolov8n.pt"
 CONFIDENCE         = 0.35
-IOU_THRESHOLD      = 0.45
+IOU_THRESHOLD      = 0.45      # NMS IoU
 MAX_DETECTIONS     = 50
 DEVICE             = "cpu"
-IMGSZ              = 640
+IMGSZ              = 640       # letterboxed network input (done inside Ultralytics)
+DETECT_EVERY_N     = 1         # run the detector on every Nth frame (1 = every frame)
+TORCH_THREADS      = None      # CPU threads for inference (None = physical cores)
 
-FOCAL_LENGTH       = 615   
+# ── Pre-processing (applied to the frame after it is downscaled to IMGSZ wide)
+PREPROCESS_DENOISE = True      # 3x3 Gaussian blur, sigma auto
+PREPROCESS_CLAHE   = True      # CLAHE on the L channel of CIE-LAB
+CLAHE_CLIP_LIMIT   = 2.0
+CLAHE_TILE_GRID    = 8         # 8x8 tiles
 
-DISTANCE_DANGER    = 1.0  
-DISTANCE_MODERATE  = 2.5  
-DISTANCE_GOOD      = 4.0  
+# ── Camera intrinsics / distance ─────────────────────────────────────────────
+# Written by:  python -m distance_estimation.calibration checkerboard ...
+CALIBRATION_FILE   = "calibration/camera_intrinsics.json"
+# Fallback used ONLY when no calibration file exists: nominal focal length from the
+# manufacturer's horizontal field of view (Logitech C920: HFOV 70.42 deg, VFOV 43.3 deg,
+# Logitech "C920 Technical Specifications"). f = (W/2) / tan(HFOV/2) = 906.9 px at 1280 px.
+# Run the checkerboard calibration before reporting measured results.
+import math as _math
+NOMINAL_HFOV_DEG   = 70.42
+NOMINAL_FOV_SOURCE = "Logitech C920 technical specifications (HFOV 70.42 deg)"
+FOCAL_LENGTH       = round((FRAME_WIDTH / 2) / _math.tan(_math.radians(NOMINAL_HFOV_DEG / 2)), 1)
 
+# Danger zones (metres) — Table III
+DISTANCE_DANGER    = 1.0       # D <= 1.0          -> DANGER  (red)
+DISTANCE_WARNING   = 2.5       # 1.0 < D <= 2.5    -> WARNING (orange)
+DISTANCE_CAUTION   = 4.0       # 2.5 < D <= 4.0    -> CAUTION (yellow)
+                               # D > 4.0           -> SAFE    (green)
+
+# A box whose left/right edge is within this many pixels of the frame border is
+# treated as CLIPPED: its width is truncated, so the pinhole distance is only an
+# upper bound on the true distance.
+EDGE_MARGIN_PX         = 4
+# A clipped box that is at least this fraction of the frame width is escalated
+# to DANGER regardless of the (over-)estimated distance.
+CLIPPED_DANGER_FRAC    = 0.5
+
+# Occlusion: a box overlapping a foreground box (lower bottom edge) with
+# IoU > this value has its distance flagged as unreliable ("estimated").
+OCCLUSION_IOU          = 0.40
+
+# Temporal smoothing of distance per track (moving average, frames) — §III-E.3
+SMOOTHING_WINDOW       = 5
+
+# Frontal real-world widths W_r,front (cm) — Table IV and extended COCO priors
 KNOWN_WIDTHS = {
     "person":        45,
     "cat":           30,
@@ -30,9 +75,9 @@ KNOWN_WIDTHS = {
     "giraffe":      150,
     "bird":          20,
     # ── Vehicles ──
-    "bicycle":       60,
-    "car":          180,
-    "motorcycle":    80,
+    "bicycle":       70,       # handlebars (Table IV)
+    "car":          180,       # bumper     (Table IV)
+    "motorcycle":    70,       # handlebars (Table IV)
     "bus":          250,
     "truck":        250,
     "airplane":     3000,
@@ -62,7 +107,7 @@ KNOWN_WIDTHS = {
     "toaster":       30,
     "refrigerator":  70,
     # ── Kitchen / food ──
-    "bottle":         7,
+    "bottle":         8,       # Table IV
     "cup":            8,
     "wine glass":     7,
     "fork":          15,
@@ -109,31 +154,44 @@ KNOWN_WIDTHS = {
     "default":       40,
 }
 
-HIGH_PRIORITY = {
-    "person", "car", "truck", "bus",
-    "motorcycle", "bicycle", "dog", "cat",
-    "horse", "cow", "bear",
-    "chair", "couch", "dining table", "bed", "toilet",
-    "bench", "suitcase", "backpack",
-    "bottle", "cup", "knife", "scissors",
-    "stairs", "traffic light", "stop sign", "fire hydrant",
-    "potted plant", "umbrella", "sports ball",
-    "laptop", "cell phone", "tv", "refrigerator",
+# Side-profile widths W_r,side (cm) and the aspect-ratio trigger (w_b / h_b) above
+# which the side width is used — Table IV. Only classes listed here switch.
+# (Person has no entry: a person's box aspect ratio does not separate frontal
+#  from side views, so no trigger can select a side width for it.)
+SIDE_PROFILE = {
+    #  class         (W_r,side cm, AR trigger)
+    "bicycle":     (175, 1.2),
+    "motorcycle":  (175, 1.2),
+    "car":         (420, 1.4),
 }
 
-# ── Voice ────────────────────────────────────
-VOICE_RATE     = 160
-VOICE_VOLUME   = 1.0
-VOICE_COOLDOWN = 2.5   
+# ── Tracking ─────────────────────────────────────────────────────────────────
+TRACK_MAX_MISSING      = 5     # frames a track survives without a match
+TRACK_MAX_MATCH_FRAC   = 0.10  # max centroid jump, as a fraction of frame width
 
-NAV_GUIDANCE_THRESHOLD = 3.0
+# ── Path guidance (§III-G) ───────────────────────────────────────────────────
+SECTOR_SPLITS          = (1 / 3, 2 / 3)   # LEFT | CENTER | RIGHT boundaries
+GUIDANCE_TRIGGER       = 2.5   # centre obstacle within this distance -> steer
+CLEAR_DISTANCE         = 3.0   # a side sector is Clear iff every obstacle in it is farther
+SECTOR_MIN_OVERLAP     = 0.10  # box must cover >=10% of a sector's width to occupy it
 
-# ── Display ──────────────────────────────────
-SHOW_FPS       = True
-SHOW_DISTANCE  = True
-SHOW_LABELS    = True
-SHOW_SIDEBAR   = True
+# ── Voice alerts (§III-H) ────────────────────────────────────────────────────
+TTS_BACKEND            = "pyttsx3"   # "pyttsx3" (offline, default) or "sapi"
+VOICE_RATE             = 190         # words per minute (pyttsx3); alerts must be short
+VOICE_VOLUME           = 1.0
+ALERT_COOLDOWN         = 3.0   # seconds per tracked object
+APPROACH_DELTA         = 0.5   # metres closer since last alert -> override cooldown
+ANNOUNCE_LEVELS        = ("DANGER", "WARNING", "CAUTION")   # SAFE is not spoken
 
-# ── Logging ──────────────────────────────────
-LOG_LEVEL  = "INFO"
-LOG_FILE   = "logs/assistant.log"
+# Classes ranked above others at equal danger level (people and vehicles)
+HIGH_PRIORITY = {
+    "person", "car", "truck", "bus", "motorcycle", "bicycle", "train",
+    "dog", "horse", "cow", "bear",
+}
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+LOG_DIR            = "logs"
+ALERT_LOG_FILE     = "logs/alerts.csv"   # one row per spoken alert, with timings
+
+# ── Display ──────────────────────────────────────────────────────────────────
+SHOW_SECTORS   = True

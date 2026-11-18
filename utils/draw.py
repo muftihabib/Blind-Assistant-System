@@ -3,9 +3,11 @@ import numpy as np
 import math
 import time
 
+from config import SECTOR_SPLITS, SHOW_SECTORS
+
 C = {
     "DANGER":   (0,  50, 255),    
-    "MODERATE": (0, 140, 255),    
+    "WARNING": (0, 140, 255),    
     "CAUTION":  (0, 210, 255),   
     "SAFE":     (255, 210,  0),   
     "HUD":      (0, 185, 255),       
@@ -128,7 +130,7 @@ def _draw_sidebar(frame, detections):
     cv2.line(frame, (sx + margin, 34), (w - margin, 34), C["HUD"], 1)
 
     # Sort: most dangerous + closest first
-    _ORD = {"DANGER": 0, "MODERATE": 1, "CAUTION": 2, "SAFE": 3}
+    _ORD = {"DANGER": 0, "WARNING": 1, "CAUTION": 2, "SAFE": 3}
     ordered = sorted(detections,
                      key=lambda d: (_ORD.get(d.get("danger_level", "SAFE"), 3),
                                     d.get("distance", 999)))
@@ -157,10 +159,7 @@ def _draw_sidebar(frame, detections):
                     font, 0.48, color, 1, cv2.LINE_AA)
 
         # Distance
-        if dist < 1.0:
-            dist_str = f"{int(dist*100)}cm"
-        else:
-            dist_str = f"{dist:.1f}m"
+        dist_str = _dist_str(d)
         cv2.putText(frame, dist_str, (sx + sw - 55, y),
                     font, 0.48, C["WHITE"], 1, cv2.LINE_AA)
 
@@ -206,12 +205,7 @@ def draw_detections(frame, detections):
         _corner_bracket(frame, x1, y1, x2, y2, color, arm=20, thick=2)
 
         # ── Label: "LAPTOP 1.8m" ──────────────────────────────────────────
-        if dist < 1.0:
-            dist_str = f"{int(dist*100)}cm"
-        else:
-            dist_str = f"{dist:.1f}m"
-
-        label = f"{cls} {dist_str}"
+        label = f"{cls} {_dist_str(d)}"
         scale = 0.65
         thick = 2
         (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
@@ -232,16 +226,26 @@ def draw_detections(frame, detections):
         # Label text with glow
         _glow_text(frame, label, (lx + 4, ly + th), font, scale, color, thick)
 
-        # ── Navigation arrow inside box ───────────────────────────────────
-        nav = d.get("nav_direction")
-        if nav and level in ("DANGER", "MODERATE"):
-            arrow = "<< MOVE LEFT" if nav == "move left" else "MOVE RIGHT >>"
-            (aw, ah), _ = cv2.getTextSize(arrow, font, 0.5, 1)
-            ax = x1 + ((x2 - x1) - aw) // 2
-            ay = (y1 + y2) // 2 + ah // 2
-            cv2.putText(frame, arrow, (ax, ay), font, 0.5, color, 1, cv2.LINE_AA)
-
     return frame
+
+
+def _dist_str(d):
+    dist = d.get("distance", 0)
+    s = f"{int(dist * 100)}cm" if dist < 1.0 else f"{dist:.1f}m"
+    if d.get("clipped"):
+        s = "<" + s          # box truncated by frame edge: upper bound only
+    elif d.get("occluded"):
+        s = "~" + s          # partially occluded: rough estimate
+    return s
+
+
+def _draw_sectors(frame):
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    for f in SECTOR_SPLITS:
+        x = int(f * w)
+        cv2.line(overlay, (x, 44), (x, h - 36), C["DIM"], 1, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
 
 # ── Top HUD bar ───────────────────────────────────────────────────────────────
@@ -293,10 +297,12 @@ def _draw_scanline(frame):
 
 
 # ── Main HUD compositor ───────────────────────────────────────────────────────
-def draw_hud(frame, fps, count, detections=None):
+def draw_hud(frame, fps, count, detections=None, guidance=None):
     detections = detections or []
 
     _draw_grid(frame)
+    if SHOW_SECTORS:
+        _draw_sectors(frame)
     _draw_top_bar(frame, fps, count)
     _draw_radar(frame, count)
     _draw_bottom_bar(frame, count)
@@ -305,29 +311,19 @@ def draw_hud(frame, fps, count, detections=None):
     if detections:
         _draw_sidebar(frame, detections)
 
-    # Navigation banner (centre-top) for most urgent DANGER/MODERATE
-    _ORD = {"DANGER": 0, "MODERATE": 1, "CAUTION": 2, "SAFE": 3}
-    if detections:
-        urgent = sorted(detections,
-                        key=lambda d: (_ORD.get(d.get("danger_level", "SAFE"), 3),
-                                       d.get("distance", 999)))
-        for d in urgent:
-            nav   = d.get("nav_direction")
-            level = d.get("danger_level", "SAFE")
-            if nav and level in ("DANGER", "MODERATE"):
-                color  = C.get(level, C["HUD"])
-                banner = f"<< MOVE LEFT" if nav == "move left" else "MOVE RIGHT >>"
-                font   = cv2.FONT_HERSHEY_SIMPLEX
-                scale  = 1.3
-                (bw, bh), _ = cv2.getTextSize(banner, font, scale, 3)
-                bx = (frame.shape[1] - bw) // 2
-                by = 90
-                # Glow background
-                bg = frame.copy()
-                cv2.rectangle(bg, (bx - 10, by - bh - 8), (bx + bw + 10, by + 8),
-                              (10, 10, 18), -1)
-                cv2.addWeighted(bg, 0.7, frame, 0.3, 0, frame)
-                _glow_text(frame, banner, (bx, by), font, scale, color, 3)
-                break
+    # Navigation banner (centre-top) from the path-guidance decision
+    action = (guidance or {}).get("action", "CLEAR")
+    if action != "CLEAR":
+        banner = {"MOVE_LEFT": "<< MOVE LEFT", "MOVE_RIGHT": "MOVE RIGHT >>",
+                  "STOP": "STOP - PATH BLOCKED"}[action]
+        hazard = guidance.get("hazard") or {}
+        color = C.get(hazard.get("danger_level", "WARNING"), C["HUD"])
+        font, scale = cv2.FONT_HERSHEY_SIMPLEX, 1.3
+        (bw, bh), _ = cv2.getTextSize(banner, font, scale, 3)
+        bx, by = (frame.shape[1] - bw) // 2, 90
+        bg = frame.copy()
+        cv2.rectangle(bg, (bx - 10, by - bh - 8), (bx + bw + 10, by + 8), (10, 10, 18), -1)
+        cv2.addWeighted(bg, 0.7, frame, 0.3, 0, frame)
+        _glow_text(frame, banner, (bx, by), font, scale, color, 3)
 
     return frame

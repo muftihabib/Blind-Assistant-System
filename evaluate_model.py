@@ -96,7 +96,7 @@ class MetricsTracker:
 
 LEVEL_COLORS = {
     "DANGER":   (0,   0,   255),
-    "MODERATE": (0,  165,  255),
+    "WARNING":  (0,  165,  255),
     "CAUTION":  (0,  255,  255),
     "SAFE":     (0,  255,    0),
     "UNKNOWN":  (180, 180,  180),
@@ -368,7 +368,7 @@ def main():
     running = True
 
     while running:
-        ret, frame = camera.read()
+        ret, frame, _ = camera.read()
         if not ret or frame is None:
             cv2.waitKey(10)
             continue
@@ -377,7 +377,10 @@ def main():
 
         # Run detection pipeline (continuous — so user sees detections live)
         detections = detector.detect(frame)
-        estimator.estimate(detections, frame_width=w)
+        estimator.estimate(detections, w, h)
+        for d in detections:
+            d["distance"] = d["distance_raw"]
+        estimator.finalize(detections, w)
 
         # Draw live feed with HUD
         display = draw_live_feed(frame, len(detections), metrics)

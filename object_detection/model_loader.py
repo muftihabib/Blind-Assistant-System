@@ -1,19 +1,28 @@
 import os
+
+import numpy as np
+import torch
 from ultralytics import YOLO
-from config import MODEL_PATH, DEVICE
 
-def load_model():
-    # Determine which model to download based on MODEL_PATH
-    model_name = os.path.basename(MODEL_PATH)   # e.g. "yolov8s.pt"
+from config import DEVICE, IMGSZ, MODEL_PATH, TORCH_THREADS
 
-    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1000:
-        print(f"[ModelLoader] {MODEL_PATH} missing/corrupt – downloading {model_name} …")
-        model = YOLO(model_name)   # downloads from ultralytics hub
-        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-        model.save(MODEL_PATH)
+
+def load_model(path=None):
+    """Load YOLO weights from `path` (default MODEL_PATH); download if missing."""
+    path = path or MODEL_PATH
+    name = os.path.basename(path)
+    if not os.path.exists(path) or os.path.getsize(path) < 1000:
+        print(f"[ModelLoader] {path} missing - downloading {name} ...")
+        model = YOLO(name)
+        if os.path.dirname(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            model.save(path)
     else:
-        model = YOLO(MODEL_PATH)
-
+        model = YOLO(path)
     model.to(DEVICE)
-    print(f"[ModelLoader] Model loaded on: {DEVICE}")
+    if DEVICE == "cpu":
+        torch.set_num_threads(TORCH_THREADS or max(1, (os.cpu_count() or 2) // 2))
+    # Warm-up so the first real frame is not slowed by lazy initialisation.
+    model.predict(np.zeros((IMGSZ // 2, IMGSZ, 3), np.uint8), imgsz=IMGSZ, verbose=False)
+    print(f"[ModelLoader] {path} loaded on {DEVICE} ({torch.get_num_threads()} threads)")
     return model

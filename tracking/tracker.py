@@ -1,90 +1,101 @@
+"""
+Lightweight centroid tracker (§III-F).
+
+Each detection is associated with an existing track of the same class by the
+nearest Euclidean centroid distance (greedy, globally closest pairs first),
+within TRACK_MAX_MATCH_FRAC * frame width. Unmatched detections start new
+tracks; tracks unseen for more than TRACK_MAX_MISSING frames are dropped.
+
+For every detection the tracker sets:
+    track_id   persistent integer id
+    distance   moving average of distance_raw over the last SMOOTHING_WINDOW
+               frames of this track (§III-E.3)
+"""
+
+from collections import deque
+
+from config import SMOOTHING_WINDOW, TRACK_MAX_MATCH_FRAC, TRACK_MAX_MISSING
+
+
+class _Track:
+    __slots__ = ("tid", "cls", "centroid", "missing", "dist_hist")
+
+    def __init__(self, tid, cls, centroid, window):
+        self.tid = tid
+        self.cls = cls
+        self.centroid = centroid
+        self.missing = 0
+        self.dist_hist = deque(maxlen=window)
+
+
+def _centroid(b):
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+
 class Tracker:
-    def __init__(self, max_missing=2):
-        self.objects = {}
-        self.next_id = 0
+    def __init__(self, max_missing=TRACK_MAX_MISSING, window=SMOOTHING_WINDOW, enabled=True):
         self.max_missing = max_missing
-        self.missing = {}
+        self.window = window
+        self.enabled = enabled
+        self.tracks = {}
+        self.next_id = 0
 
     def reset(self):
-        self.objects.clear()
-        self.missing.clear()
-        self.next_id = 0
+        self.tracks.clear()
 
-    def update(self, detections):
-        if not detections:
-            self.reset()
-            return []
+    @property
+    def active_ids(self):
+        return set(self.tracks.keys())
 
-        tracked = []
-        for oid, info in list(self.objects.items()):
-            tracked.append((oid, info["centroid"], info.get("class_name"), info.get("bbox")))
+    def update(self, detections, frame_width):
+        if not self.enabled:
+            # Ablation mode: no identity across frames, no smoothing.
+            for d in detections:
+                d["track_id"] = self.next_id
+                self.next_id += 1
+                d["distance"] = d["distance_raw"]
+            return detections
 
-        new_objects = {}
-        used_indices = set()
+        max_jump = TRACK_MAX_MATCH_FRAC * frame_width
+        cents = [_centroid(d["bbox"]) for d in detections]
 
-        for oid, centroid, cls_name, bbox in tracked:
-            best_idx = -1
-            best_dist = float("inf")
-
-            for i, det in enumerate(detections):
-                if i in used_indices:
+        pairs = []
+        for tid, t in self.tracks.items():
+            for i, d in enumerate(detections):
+                if d["class"] != t.cls:
                     continue
+                dx, dy = cents[i][0] - t.centroid[0], cents[i][1] - t.centroid[1]
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist <= max_jump:
+                    pairs.append((dist, tid, i))
+        pairs.sort()
 
-                det_cls = det.get("class", "")
-                det_center = ((det["bbox"][0] + det["bbox"][2]) // 2,
-                              (det["bbox"][1] + det["bbox"][3]) // 2)
-                dist = ((centroid[0] - det_center[0]) ** 2 + (centroid[1] - det_center[1]) ** 2) ** 0.5
-
-                same_class = cls_name is None or det_cls == cls_name
-                if same_class and dist < best_dist:
-                    best_dist = dist
-                    best_idx = i
-
-            if best_idx >= 0 and best_dist < 120:
-                used_indices.add(best_idx)
-                new_objects[oid] = {
-                    "centroid": ((detections[best_idx]["bbox"][0] + detections[best_idx]["bbox"][2]) // 2,
-                                 (detections[best_idx]["bbox"][1] + detections[best_idx]["bbox"][3]) // 2),
-                    "class_name": detections[best_idx].get("class"),
-                    "bbox": detections[best_idx]["bbox"],
-                }
-                self.missing[oid] = 0
-            else:
-                self.missing[oid] = self.missing.get(oid, 0) + 1
-                if self.missing.get(oid, 0) > self.max_missing:
-                    continue
-                new_objects[oid] = {
-                    "centroid": centroid,
-                    "class_name": cls_name,
-                    "bbox": bbox,
-                }
-
-        for oid in list(self.missing.keys()):
-            if self.missing.get(oid, 0) > self.max_missing and oid not in new_objects:
-                del self.missing[oid]
-
-        for i, det in enumerate(detections):
-            if i in used_indices:
+        used_t, used_d = set(), set()
+        for _, tid, i in pairs:
+            if tid in used_t or i in used_d:
                 continue
-            new_id = self.next_id
+            used_t.add(tid); used_d.add(i)
+            t = self.tracks[tid]
+            t.centroid = cents[i]
+            t.missing = 0
+            detections[i]["track_id"] = tid
+
+        for tid in list(self.tracks):
+            if tid not in used_t:
+                self.tracks[tid].missing += 1
+                if self.tracks[tid].missing > self.max_missing:
+                    del self.tracks[tid]
+
+        for i, d in enumerate(detections):
+            if i in used_d:
+                continue
+            t = _Track(self.next_id, d["class"], cents[i], self.window)
+            self.tracks[t.tid] = t
+            d["track_id"] = t.tid
             self.next_id += 1
-            new_objects[new_id] = {
-                "centroid": ((det["bbox"][0] + det["bbox"][2]) // 2,
-                             (det["bbox"][1] + det["bbox"][3]) // 2),
-                "class_name": det.get("class"),
-                "bbox": det["bbox"],
-            }
-            self.missing[new_id] = 0
 
-        self.objects = new_objects
-        keys = list(self.objects.keys())
-        for i, det in enumerate(detections):
-            det["track_id"] = -1
-            for oid, info in self.objects.items():
-                if info["bbox"] == det["bbox"]:
-                    det["track_id"] = oid
-                    break
-            if det["track_id"] == -1 and i < len(keys):
-                det["track_id"] = keys[i]
-
+        for d in detections:
+            t = self.tracks[d["track_id"]]
+            t.dist_hist.append(d["distance_raw"])
+            d["distance"] = round(sum(t.dist_hist) / len(t.dist_hist), 3)
         return detections

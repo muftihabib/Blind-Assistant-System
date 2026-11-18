@@ -1,79 +1,53 @@
 import cv2
-import numpy as np
-import time
+
 from object_detection.model_loader import load_model
-from config import CONFIDENCE, IOU_THRESHOLD, MAX_DETECTIONS, KNOWN_WIDTHS, HIGH_PRIORITY, IMGSZ
+from object_detection.preprocess import Preprocessor
+from config import CONFIDENCE, IOU_THRESHOLD, MAX_DETECTIONS, IMGSZ
+
 
 class Detector:
-    def __init__(self):
-        self.model = load_model()
-        self._frame_count = 0
-        self._log_interval = 10   # print debug info every N detections
+    """YOLOv8n wrapper. Boxes are in the coordinates of the input (capture) frame."""
+
+    def __init__(self, model_path=None, preprocess=True, conf=CONFIDENCE,
+                 iou=IOU_THRESHOLD, imgsz=IMGSZ):
+        self.model = load_model(model_path)
+        self.pre = Preprocessor() if preprocess else None
+        self.conf, self.iou, self.imgsz = conf, iou, imgsz
+
+    def predict_raw(self, frame, conf=None, max_det=MAX_DETECTIONS):
+        """Return (Ultralytics result, scale): box coords * scale = capture-frame pixels."""
+        h, w = frame.shape[:2]
+        scale = 1.0
+        if w > self.imgsz:
+            scale = w / self.imgsz
+            frame = cv2.resize(frame, (self.imgsz, round(h / scale)), interpolation=cv2.INTER_AREA)
+        img = self.pre(frame) if self.pre else frame
+        res = self.model.predict(source=img, conf=self.conf if conf is None else conf,
+                                 iou=self.iou, max_det=max_det, imgsz=self.imgsz,
+                                 verbose=False)[0]
+        return res, scale
 
     def detect(self, frame):
-        """Return list of detection dicts for ALL objects in frame"""
+        result, scale = self.predict_raw(frame)
         detections = []
-        self._frame_count += 1
+        if result.boxes is None or len(result.boxes) == 0:
+            return detections
 
-        try:
-            # Use augmented prediction for better detection accuracy
-            results = self.model.predict(
-                source=frame,
-                conf=CONFIDENCE,
-                iou=IOU_THRESHOLD,
-                max_det=MAX_DETECTIONS,
-                imgsz=IMGSZ,
-                verbose=False,
-                stream=False,
-            )
-            if not results:
-                return detections
+        boxes = result.boxes.xyxy.cpu().numpy() * scale
+        confs = result.boxes.conf.cpu().numpy()
+        cls_ids = result.boxes.cls.cpu().numpy().astype(int)
+        names = result.names
 
-            result = results[0]
-            if result.boxes is None or len(result.boxes) == 0:
-                if self._frame_count % self._log_interval == 0:
-                    print(f"[Detector] Frame {self._frame_count}: NO objects detected")
-                return detections
-
-            # ── bulk numpy extract ──────────────────
-            boxes_xyxy  = result.boxes.xyxy.cpu().numpy()   # [N,4]
-            confs       = result.boxes.conf.cpu().numpy()    # [N]
-            cls_ids     = result.boxes.cls.cpu().numpy().astype(int)  # [N]
-            names       = result.names                       # dict
-
-            # ── DEBUG: log all raw detections ──────────
-            if self._frame_count % self._log_interval == 0:
-                raw_objects = []
-                for i in range(len(boxes_xyxy)):
-                    cls_name = names.get(cls_ids[i], "?")
-                    raw_objects.append(f"{cls_name}({confs[i]:.0%})")
-                print(f"[Detector] Frame {self._frame_count}: Found {len(boxes_xyxy)} objects → {', '.join(raw_objects)}")
-
-            for i in range(len(boxes_xyxy)):
-                x1,y1,x2,y2 = boxes_xyxy[i]
-                conf         = float(confs[i])
-                cls_id       = cls_ids[i]
-                class_name   = names.get(cls_id, "object")
-
-                bbox_w = x2 - x1
-                bbox_h = y2 - y1
-                if bbox_w < 2 or bbox_h < 2:   # too small – skip noise
-                    continue
-
-                detections.append({
-                    "class":       class_name,
-                    "confidence":  conf,
-                    "bbox":        (int(x1), int(y1), int(x2), int(y2)),
-                    "bbox_width":  float(bbox_w),
-                    "bbox_height": float(bbox_h),
-                    "known_width": KNOWN_WIDTHS.get(class_name,
-                                   KNOWN_WIDTHS["default"]),
-                    "priority":    class_name in HIGH_PRIORITY,
-                })
-
-        except Exception as e:
-            print(f"[Detector] Error: {e}")
-            import traceback
-            traceback.print_exc()
-
+        for (x1, y1, x2, y2), conf, cid in zip(boxes, confs, cls_ids):
+            bw, bh = float(x2 - x1), float(y2 - y1)
+            if bw < 2 or bh < 2:
+                continue
+            detections.append({
+                "class": names.get(int(cid), "object"),
+                "class_id": int(cid),
+                "confidence": float(conf),
+                "bbox": (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))),
+                "bbox_width": bw,
+                "bbox_height": bh,
+            })
         return detections
